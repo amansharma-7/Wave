@@ -2,7 +2,7 @@
 // Imports – Logger, Redis, Models
 // =======================
 const logger = require("../utils/logger");
-const redis = require("./redis");
+const { redis } = require("./redis");
 const User = require("../models/userModel");
 
 // =======================
@@ -15,7 +15,7 @@ async function updateLastSeenInDB(userId, timestamp) {
       { $set: { lastSeen: new Date(timestamp) } }
     );
   } catch (err) {
-    console.error("❌ Failed to update lastSeen in DB", err);
+    logger.error("❌ Failed to update lastSeen in DB", err);
   }
 }
 
@@ -24,18 +24,20 @@ async function updateLastSeenInDB(userId, timestamp) {
 // =======================
 const PRESENCE_KEY = (userId) => `presence:${userId}`;
 const SOCKETS_KEY = (userId) => `sockets:${userId}`;
-const PRESENCE_TTL = 60; // seconds
+const PRESENCE_TTL = 60;
 
-/* ======================================================
-   INTERNAL HELPER
-   - Redis v4 compatible
-   - Ensures all values are strings
-   - Uses pipeline-style Promise batching
-====================================================== */
+// =======================
+// Call Busy Key
+// =======================
+const CALL_BUSY_KEY = (userId) => `call_busy:${userId}`;
+const CALL_BUSY_TTL = 90;
+
+// =======================
+// INTERNAL HELPERS
+// =======================
 async function updatePresence(userId, data = {}) {
   const key = PRESENCE_KEY(userId);
 
-  // Normalize values (Redis stores strings only)
   const status = String(data.status ?? "offline");
   const activeChatId = String(data.activeChatId ?? "none");
   const lastSeen = String(data.lastSeen ?? Date.now());
@@ -48,16 +50,11 @@ async function updatePresence(userId, data = {}) {
       redis.expire(key, PRESENCE_TTL),
     ]);
   } catch (error) {
-    console.error("❌ Failed to update presence in Redis", error);
+    logger.error("❌ Failed to update presence in Redis", error);
   }
 }
 
-/* ======================================================
-   USER COMES ONLINE
-   - Multi-tab safe using socket set
-====================================================== */
 async function setOnline(userId, socketId) {
-  // Track active sockets
   await redis.sAdd(SOCKETS_KEY(userId), socketId);
   await redis.expire(SOCKETS_KEY(userId), PRESENCE_TTL);
 
@@ -67,9 +64,6 @@ async function setOnline(userId, socketId) {
   });
 }
 
-/* ======================================================
-   USER ENTERS A CHAT
-====================================================== */
 async function setInChat(userId, chatId) {
   await updatePresence(userId, {
     status: "in_chat",
@@ -77,9 +71,6 @@ async function setInChat(userId, chatId) {
   });
 }
 
-/* ======================================================
-   USER LEAVES CHAT (STILL ONLINE)
-====================================================== */
 async function setOnlineFromChat(userId) {
   await updatePresence(userId, {
     status: "online",
@@ -87,18 +78,11 @@ async function setOnlineFromChat(userId) {
   });
 }
 
-/* ======================================================
-   SOCKET DISCONNECT
-   - Handles multi-tab scenarios
-   - Updates DB only when fully offline
-====================================================== */
 async function handleDisconnect(userId, socketId) {
-  // Remove disconnected socket
   await redis.sRem(SOCKETS_KEY(userId), socketId);
 
   const sockets = await redis.sMembers(SOCKETS_KEY(userId));
 
-  // User fully offline (no active sockets)
   if (sockets.length === 0) {
     const now = Date.now();
 
@@ -108,23 +92,16 @@ async function handleDisconnect(userId, socketId) {
       lastSeen: String(now),
     });
 
-    // Persist lastSeen in MongoDB
     await updateLastSeenInDB(userId, now);
-
     return true;
   }
 
   return false;
 }
 
-/* ======================================================
-   READ PRESENCE
-   - Fallback safe
-====================================================== */
 async function getPresence(userId) {
   const presence = await redis.hGetAll(PRESENCE_KEY(userId));
 
-  // Normalize empty Redis result
   if (!presence || Object.keys(presence).length === 0) {
     return {
       status: "offline",
@@ -136,6 +113,26 @@ async function getPresence(userId) {
   return presence;
 }
 
+async function isUserOnline(userId) {
+  const presence = await redis.hGetAll(PRESENCE_KEY(userId));
+  return presence?.status === "online" || presence?.status === "in_chat";
+}
+
+// =======================
+// CALL BUSY HELPERS
+// =======================
+async function setUserBusy(userId, callId) {
+  await redis.set(CALL_BUSY_KEY(userId), String(callId), { EX: CALL_BUSY_TTL });
+}
+
+async function clearUserBusy(userId) {
+  await redis.del(CALL_BUSY_KEY(userId));
+}
+
+async function isUserBusy(userId) {
+  return (await redis.exists(CALL_BUSY_KEY(userId))) === 1;
+}
+
 // =======================
 // Exports
 // =======================
@@ -145,4 +142,8 @@ module.exports = {
   setOnlineFromChat,
   handleDisconnect,
   getPresence,
+  isUserOnline,
+  setUserBusy,
+  clearUserBusy,
+  isUserBusy,
 };
